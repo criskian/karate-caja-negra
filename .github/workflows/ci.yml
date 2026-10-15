@@ -1,0 +1,201 @@
+name: Karate Tests
+
+# - push / pull_request: ejecuta TODA la suite como validación de integración continua.
+# - workflow_dispatch:   ejecuta toda la suite o solo los tags indicados (p. ej. @GH-1)
+#                        y, además, comenta el resultado en cada issue y actualiza sus labels.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag(s) a ejecutar separados por coma, p. ej. @GH-1 o @GH-1,@GH-2. Vacío = toda la suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # Las APIs de caja negra comparten estado global: dos corridas simultáneas se pisarían.
+  group: karate-api-state
+  cancel-in-progress: false
+
+env:
+  API_URL: https://taller-de-tecnicas-de-prueba-de-caja.onrender.com/api
+
+jobs:
+  karate:
+    name: Ejecutar escenarios Karate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Gradle (con caché)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Validar el input de tags
+        id: tags
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          # Se pasa por variable de entorno (no interpolado en el script) para evitar inyección.
+          clean="$(echo "$INPUT_TAG" | tr -d '[:space:]')"
+          if [ -n "$clean" ] && ! echo "$clean" | grep -Eq '^@[A-Za-z0-9_-]+(,@[A-Za-z0-9_-]+)*$'; then
+            echo "::error::Tag inválido: '$clean'. Use el formato @GH-1 o @GH-1,@GH-2"
+            exit 1
+          fi
+          echo "value=$clean" >> "$GITHUB_OUTPUT"
+
+      - name: Despertar la API (cold start de Render)
+        run: |
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 90 "$API_URL/ejercicios" || true)
+            echo "intento $i -> HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::warning::La API no respondió 200 al calentar; se intenta correr las pruebas igualmente"
+
+      - name: Ejecutar pruebas Karate
+        id: tests
+        continue-on-error: true
+        env:
+          TAGS: ${{ steps.tags.outputs.value }}
+        run: |
+          chmod +x gradlew
+          if [ -n "$TAGS" ]; then
+            ./gradlew test --no-daemon -Dkarate.options="--tags $TAGS"
+          else
+            ./gradlew test --no-daemon
+          fi
+
+      - name: Publicar reporte de Karate como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: karate-reports
+          path: target/karate-reports
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Resumen y actualización de issues
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          UPDATE_ISSUES: ${{ github.event_name == 'workflow_dispatch' }}
+          REQUESTED_TAGS: ${{ steps.tags.outputs.value }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const reportDir = 'target/karate-reports';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // 1) Leer el reporte Cucumber JSON que genera el Runner (outputCucumberJson)
+            const files = fs.existsSync(reportDir)
+              ? fs.readdirSync(reportDir).filter(f => f.endsWith('.json'))
+              : [];
+            const results = {}; // issue -> { scenarios, failed, names: [] }
+            for (const file of files) {
+              const features = JSON.parse(fs.readFileSync(path.join(reportDir, file), 'utf8'));
+              for (const feature of features) {
+                for (const el of feature.elements || []) {
+                  if (el.type !== 'scenario') continue; // se omiten los Background
+                  const ok = (el.steps || []).every(s => s.result && s.result.status === 'passed');
+                  const issueTags = (el.tags || []).map(t => t.name).filter(n => /^@GH-\d+$/.test(n));
+                  for (const tag of issueTags) {
+                    const issue = parseInt(tag.slice(4), 10);
+                    const r = results[issue] ||= { scenarios: 0, failed: 0, failedNames: [] };
+                    r.scenarios += 1;
+                    if (!ok) { r.failed += 1; r.failedNames.push(el.name); }
+                  }
+                }
+              }
+            }
+
+            // 2) Resumen en la pestaña del job
+            const issues = Object.keys(results).map(Number).sort((a, b) => a - b);
+            const rows = issues.map(n => {
+              const r = results[n];
+              const status = r.failed === 0 ? '✅ PASSED' : '❌ FAILED';
+              return [`#${n}`, `@GH-${n}`, String(r.scenarios), String(r.failed), status];
+            });
+            await core.summary
+              .addHeading('Resultado por issue (caso de prueba)')
+              .addTable([
+                [{data: 'Issue', header: true}, {data: 'Tag', header: true},
+                 {data: 'Ejecuciones', header: true}, {data: 'Fallidas', header: true},
+                 {data: 'Estado', header: true}],
+                ...rows])
+              .write();
+
+            if (issues.length === 0) {
+              core.warning('No se encontraron escenarios con tag @GH-n en el reporte.');
+              return;
+            }
+
+            // 3) Solo en ejecución manual: comentar en el issue y actualizar labels
+            if (process.env.UPDATE_ISSUES !== 'true') {
+              core.info('Evento distinto de workflow_dispatch: no se modifican issues.');
+              return;
+            }
+            const requested = (process.env.REQUESTED_TAGS || '').split(',').filter(Boolean);
+            const requestedIssues = requested
+              .filter(t => /^@GH-\d+$/.test(t)).map(t => parseInt(t.slice(4), 10));
+            for (const n of requestedIssues) {
+              if (!results[n]) core.warning(`El tag @GH-${n} no produjo ningún escenario en el reporte.`);
+            }
+
+            for (const n of issues) {
+              const r = results[n];
+              const passed = r.failed === 0;
+              const statusText = passed ? 'PASSED ✅' : 'FAILED ❌';
+              const detail = passed
+                ? `${r.scenarios} ejecución(es) del escenario, todas exitosas.`
+                : `${r.failed} de ${r.scenarios} ejecución(es) fallaron:\n` +
+                  r.failedNames.map(x => `- ${x}`).join('\n');
+              const body = [
+                `### Resultado automatizado: **${statusText}**`,
+                '',
+                `- **Tag:** \`@GH-${n}\``,
+                `- **Detalle:** ${detail}`,
+                `- **Pipeline:** ${runUrl}`,
+                `- **Commit:** \`${context.sha.slice(0, 7)}\``,
+              ].join('\n');
+
+              try {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: n, body });
+
+                const add = passed ? 'automated-passed' : 'automated-failed';
+                const remove = passed ? 'automated-failed' : 'automated-passed';
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner: context.repo.owner, repo: context.repo.repo, issue_number: n, name: remove });
+                } catch (e) { /* el label opuesto puede no estar puesto */ }
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner, repo: context.repo.repo, issue_number: n, labels: [add] });
+                core.info(`Issue #${n} actualizado: ${statusText}`);
+              } catch (e) {
+                core.warning(`No se pudo actualizar el issue #${n}: ${e.message}`);
+              }
+            }
+
+      - name: Fallar el job si las pruebas fallaron
+        if: steps.tests.outcome == 'failure'
+        run: |
+          echo "::error::Hay escenarios Karate fallidos. Revise el artefacto karate-reports."
+          exit 1
