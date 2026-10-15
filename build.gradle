@@ -22,10 +22,15 @@ dependencies {
 test {
     useJUnitPlatform()
 
-    // Permite filtrar por tags desde la CLI: -Dkarate.options="--tags @GH-1"
-    systemProperty "karate.options", System.getProperty("karate.options")
-    // Permite apuntar la suite a otro ambiente: -DbaseUrl=http://localhost:3000/api
-    systemProperty "baseUrl", System.getProperty("baseUrl")
+    // Solo se propagan las propiedades que realmente vienen por CLI
+    // (evita pasar el literal "null" a Karate cuando no se definen).
+    // Filtrar por tags:   -Dkarate.options="--tags @GH-1"
+    // Cambiar ambiente:   -DbaseUrl=http://localhost:3000/api
+    ['karate.options', 'baseUrl'].each { name ->
+        if (System.getProperty(name)) {
+            systemProperty name, System.getProperty(name)
+        }
+    }
 
     // Los reportes de Karate quedan en target/ y no se reutilizan resultados viejos
     outputs.upToDateWhen { false }

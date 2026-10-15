@@ -1,0 +1,7 @@
+{
+  "S1 (Tapa Abierta)": [],
+  "S2 (Llenando Agua)": ["Cerrar Tapa"],
+  "S3 (Lavando)": ["Cerrar Tapa", "Nivel OK"],
+  "S4 (Centrifugando)": ["Cerrar Tapa", "Nivel OK", "Fin Lavado"],
+  "S5 (Parada de Emergencia)": ["Cerrar Tapa", "Apertura Forzosa"]
+}
