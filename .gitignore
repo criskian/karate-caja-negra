@@ -1,0 +1,16 @@
+# Gradle
+.gradle/
+build/
+
+# Reportes de Karate
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+out/
+
+# SO
+.DS_Store
+Thumbs.db

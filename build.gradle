@@ -1,0 +1,40 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.cajanegra'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    karateVersion = '1.4.1'
+}
+
+dependencies {
+    testImplementation "com.intuit.karate:karate-junit5:${karateVersion}"
+    testImplementation "ch.qos.logback:logback-classic:1.5.6"
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+
+    // Permite filtrar por tags desde la CLI: -Dkarate.options="--tags @GH-1"
+    systemProperty "karate.options", System.getProperty("karate.options")
+    // Permite apuntar la suite a otro ambiente: -DbaseUrl=http://localhost:3000/api
+    systemProperty "baseUrl", System.getProperty("baseUrl")
+
+    // Los reportes de Karate quedan en target/ y no se reutilizan resultados viejos
+    outputs.upToDateWhen { false }
+    testLogging {
+        events "passed", "failed", "skipped"
+        showStandardStreams = false
+    }
+}
+
+clean {
+    delete 'target'
+}
